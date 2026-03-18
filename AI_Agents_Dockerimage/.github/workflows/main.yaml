@@ -1,0 +1,78 @@
+name: Build & Push Legacy Java App via Azure AI Agent
+
+on:
+  workflow_dispatch: 
+
+env:
+  IMAGE_NAME: legacy-servlet-app
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  REGISTRY: ${{ secrets.ACR_NAME }}.azurecr.io
+  TAG: ${{ github.sha }} 
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show repo structure
+        run: |
+          pwd
+          ls -la
+          [ -f doc.py ] && echo "doc.py present" || echo "doc.py missing"
+          [ -f pom.xml ] && echo "pom.xml present" || echo "pom.xml missing"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps (agent caller)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ---- Azure login (Service Principal via JSON secret) ----
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # ---- Acquire Entra token for Agent Service (resource = https://ai.azure.com/) ----
+      - name: Get AI Foundry access token
+        run: |
+          AIF_TOKEN=$(az account get-access-token --resource https://ai.azure.com/ --query accessToken -o tsv)
+          if [ -z "$AIF_TOKEN" ]; then
+            echo "Failed to get Entra token for https://ai.azure.com/"
+            exit 1
+          fi
+          echo "AIF_TOKEN=$AIF_TOKEN" >> $GITHUB_ENV
+
+      - name: Generate Dockerfile via Azure AI Foundry Agent
+        env:
+          AZURE_AIF_ENDPOINT: ${{ secrets.AZURE_AIF_ENDPOINT }}
+          AZURE_AIF_API_KEY: ${{ secrets.AZURE_AIF_API_KEY }}
+          AZURE_AIF_AGENT_ID: ${{ secrets.AZURE_AIF_AGENT_ID }}
+        run: |
+          set -e
+          python doc.py
+          echo "---- Dockerfile produced by agent ----"
+          sed -n '1,120p' Dockerfile
+
+      # Login to ACR using the Azure CLI session
+      - name: ACR login via Azure CLI
+        run: az acr login --name $ACR_NAME
+
+      - name: Build & tag
+        run: |
+          docker build -t $REGISTRY/$IMAGE_NAME:$TAG -t $REGISTRY/$IMAGE_NAME:latest .
+
+      - name: Push
+        run: |
+          docker push $REGISTRY/$IMAGE_NAME:$TAG
+          docker push $REGISTRY/$IMAGE_NAME:latest
+
+      - name: Output image
+        run: echo "Pushed $REGISTRY/$IMAGE_NAME:$TAG and :latest"
